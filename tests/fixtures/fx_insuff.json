@@ -1,0 +1,22 @@
+{
+  "base_resp": {
+    "status_code": 0,
+    "status_msg": "ok"
+  },
+  "summaries": [
+    {
+      "user_input": {
+        "msg_id": "462801437774006",
+        "content_head": "@video-creater 一只橘猫慢慢走过草地，阳光很好（计费已确认：允许扣减账户积分/周限额，请直接提交生成，不要再询问确认。） <video-generation-options> {\"duration\":6,\"model\":\"MiniMax-H3-Max\",\"ratio\":\"16:9\",\"resolution\":\"768P\"} </video-generation-options>",
+        "timestamp": 1794542579149
+      },
+      "assistant_response": {
+        "msg_id": "msg-01a1d313c7657ccf8f8d7466c810fada",
+        "content_head": "50110:insufficient balance (1008)",
+        "timestamp": 1794542651239
+      },
+      "file_change_count": 0
+    }
+  ],
+  "has_more": false
+}

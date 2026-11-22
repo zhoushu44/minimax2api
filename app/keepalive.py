@@ -118,7 +118,18 @@ async def refresh_with_token(
     if not token:
         # A refused refresh is a real answer ("invalid_grant"), not a blip, and
         # the caller falls through to the password path.
-        return RenewResult(error=str(payload.get("error_description") or payload.get("error") or payload)[:200])
+        #
+        # The OAuth ``error`` code is kept alongside the human description: the
+        # death verdict is decided on the *protocol* field (RFC 6749 §5.2
+        # ``invalid_grant`` means the refresh token is dead/revoked), while the
+        # description alone is prose that upstream may reword at any time.
+        code = str(payload.get("error") or "").strip()
+        desc = str(payload.get("error_description") or "").strip()
+        if code and desc:
+            message = f"{code}: {desc}"
+        else:
+            message = code or desc or str(payload)
+        return RenewResult(error=message[:200])
     ttl = float(payload.get("expires_in") or DEFAULT_TOKEN_TTL_SEC)
     return RenewResult(
         ok=True,
@@ -175,6 +186,72 @@ async def renew_with_password(
         refresh_token=refresh,
         expires_at=time.time() + DEFAULT_TOKEN_TTL_SEC,
     )
+
+
+# ── 死号判定 ────────────────────────────────────────────────────────────
+#
+# 只认**协议级/业务级的确定答复**，不认任何"可能只是暂时"的错误。
+#
+# ``invalid_grant`` 来自 RFC 6749 §5.2：refresh token 无效、过期或已被撤销。
+# 这是上游明确说"这个 refresh token 不能再用"，不是网络、不是限流、不是余额。
+#
+# 官方错误码表（platform.minimax.io/docs/api-reference/errorcode）里没有任何
+# 一个码表示"账号永久失效"——1004 的官方处置是 "log in again"，2049 是
+# "check your API Key"，两者都可恢复，因此都不作为删除依据。
+_DEFINITIVE_GRANT_ERRORS = (
+    "invalid_grant",                      # RFC 6749 §5.2 协议字段
+    "this refresh token can no longer be used",   # 官方 error_description 原文
+    "start a new authorization",          # 同上后半句
+)
+
+# 出现这些字样一律不当死号：网络、限流、额度、余额、服务端故障。
+_NEVER_DEAD_MARKERS = (
+    "timeout", "timed out", "connect", "connection", "network", "dns", "ssl",
+    "rate limit", "too many", "usage limit", "quota", "balance", "insufficient",
+    "overload", "high load", "temporarily", "unavailable", "internal error",
+    "server error", "502", "503", "504", "429", "401", "403",
+)
+
+
+def is_definitive_death(refresh_error: str, password_error: str,
+                        transient: bool) -> tuple[bool, str]:
+    """一条记录是否确定死亡。返回 (能否删, 理由)。
+
+    必须同时满足：
+      1. 不是 transient（网络问题直接排除）；
+      2. refresh 的错误命中 ``invalid_grant``；
+      3. 密码路径也失败，且**不是**因为"没存密码"（那只是不可续期，不是死）；
+      4. 两条错误里都不含任何"临时性"标记。
+
+    任何一条不满足就不删 —— 宁可留一个死号，也不误杀一个活号。
+    """
+    if transient:
+        return False, "transient（网络问题，凭据未被评判）"
+
+    blob = f"{refresh_error} {password_error}".lower()
+    for marker in _NEVER_DEAD_MARKERS:
+        if marker in blob:
+            return False, f"含临时性标记 {marker!r}"
+
+    granted = any(code in refresh_error.lower() for code in _DEFINITIVE_GRANT_ERRORS)
+    if not granted:
+        return False, "refresh 未返回 invalid_grant"
+
+    if not password_error:
+        # 密码路径没报错却也没成功：状态不明，不删。
+        return False, "密码路径无明确结论"
+
+    if "no email/password stored" in password_error.lower():
+        # 只是没存密码，号本身可能还活着（refresh 坏了但密码能手动补）。
+        return False, "未存密码（不可续期，非死亡）"
+
+    # "New user has not set a password" 说明这个账号在上游**本来就没有密码**，
+    # 因此密码路径不是一条独立的旁证 —— 它失败与否都不能证明账号死了。
+    # 只有"确实设过密码、但登录被拒"才算第二重确认。
+    if "has not set a password" in password_error.lower():
+        return False, "账号本身未设密码，密码路径不构成旁证"
+
+    return True, f"refresh=invalid_grant；password={password_error[:80]}"
 
 
 class Keeper:
@@ -299,6 +376,7 @@ class Keeper:
             due.append(account)
 
         renewed, failed, transient = 0, 0, 0
+        doomed: list[tuple[str, str, str]] = []  # (account_id, name, reason)
         for account in due:
             try:
                 result = await self.renew_account(account.id)
@@ -312,9 +390,16 @@ class Keeper:
                 transient += 1
             else:
                 failed += 1
+                # 只有"确定性死亡"才进候选，其余一律留着。用本次的 result
+                # 判定，不读库里的 last_error（那是上一次的旧值）。
+                verdict, reason = self._death_verdict(account, result)
+                if verdict:
+                    doomed.append((account.id, account.name or account.id, reason))
             # Space the renewals: a burst of token grants from one address is its
             # own pattern, and there is no urgency — each account has minutes.
             await asyncio.sleep(2.0)
+
+        pruned = await self._prune(doomed)
 
         self._last_run = {
             "at": now,
@@ -323,8 +408,80 @@ class Keeper:
             "failed": failed,
             "transient": transient,
             "skipped": skipped,
+            "doomed": len(doomed),
+            "pruned": pruned,
         }
         return self._last_run
+
+    def _death_verdict(self, account: Any, result: Any = None) -> tuple[bool, str]:
+        """续期失败后，判断这个号是否确定死亡。
+
+        判据完全基于**本次**续期的失败详情（``result.error``），不回头读
+        ``account.last_error``：那是上一次写的旧值，可能为空或已过期。
+
+        不推测、不"看次数猜"。
+        """
+        try:
+            settings = self._settings_fn()
+            cfg = settings.keepalive
+            if not getattr(cfg, "auto_prune", False):
+                return False, "auto_prune 关闭"
+            rounds = int(getattr(cfg, "auto_prune_rounds", 1) or 1)
+        except Exception:  # noqa: BLE001
+            return False, "读配置失败"
+
+        raw = str(getattr(result, "error", "") or "") if result is not None else ""
+        if not raw:
+            return False, "无错误记录"
+
+        # renew_account 失败时写的是 "refresh: <x> | password: <y>"
+        refresh_err, password_err = "", ""
+        if "| password:" in raw:
+            left, right = raw.split("| password:", 1)
+            password_err = right.strip()
+            refresh_err = left.split("refresh:", 1)[-1].strip() if "refresh:" in left else left.strip()
+        elif "refresh:" in raw:
+            refresh_err = raw.split("refresh:", 1)[-1].strip()
+        else:
+            refresh_err = raw
+
+        # 密码路径只有在"存了密码却仍失败"时才算一次否定证据。
+        has_pw = bool(getattr(account, "email", "")) and bool(getattr(account, "password", ""))
+        if has_pw and not password_err:
+            return False, "密码路径未尝试或结论不明"
+
+        ok, reason = is_definitive_death(refresh_err, password_err, transient=False)
+        if not ok:
+            return False, reason
+
+        # 需要连续 N 轮确认时，用 fail_count 累计（成功续期会把它清零）。
+        if rounds > 1:
+            fails = int(getattr(account, "fail_count", 0) or 0)
+            if fails + 1 < rounds:
+                return False, f"确定性失败第 {fails + 1}/{rounds} 轮，未达阈值"
+
+        return True, reason
+
+    async def _prune(self, doomed: list[tuple[str, str, str]]) -> int:
+        """删除确定死亡的号。带上限，且先把判据写进日志。"""
+        if not doomed:
+            return 0
+        try:
+            cap = int(self._settings_fn().keepalive.auto_prune_max_per_run or 5)
+        except Exception:  # noqa: BLE001
+            cap = 5
+        batch = doomed[: max(1, cap)]
+        ids = [item[0] for item in batch]
+        for _aid, name, reason in batch:
+            # 删了也要留痕：控制台和 docker logs 都能查到为什么删。
+            print(f"[keepalive] PRUNE {name}: {reason}", flush=True)
+        try:
+            removed = await self._db.delete_accounts(ids)
+        except Exception as err:  # noqa: BLE001
+            print(f"[keepalive] prune failed: {err}", flush=True)
+            return 0
+        print(f"[keepalive] pruned {removed}/{len(ids)} dead accounts", flush=True)
+        return int(removed or 0)
 
     def status(self) -> dict[str, Any]:
         return {

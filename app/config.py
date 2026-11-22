@@ -248,6 +248,25 @@ class KeepaliveSettings:
     # not be tuned by changing the other.
     interval_sec: int = 1800
 
+    # ── 死号自动清理 ────────────────────────────────────────────────────
+    #
+    # 只删**确定性**死号：一轮续期里 refresh 返回 OAuth 的 ``invalid_grant``
+    # （RFC 6749 定义的「refresh token 失效/被撤销」），**并且**密码登录也被
+    # 明确拒绝。两者都是协议/业务层的确定答复，不是网络问题。
+    #
+    # 绝不删的情况（全部来自官方错误码表 + 实测）：
+    #   * ``transient=True``（ConnectError / Timeout 等，凭据根本没被评判）；
+    #   * 1004 / 2049（官方定义为 "log in again" / "check your API Key"，可恢复）；
+    #   * 1002 / 1039 / 2056 / 2062 / 2067（限流、额度窗口、5 小时窗口用完）；
+    #   * 1008 / 2053（余额不足）；2069（模型下线）；5xx / 429 / 404。
+    #
+    # 默认关闭：删除不可逆，要不要开由操作者决定。
+    auto_prune: bool = False
+    # 单轮确认即可删（操作者选定的策略）。改大等于要求连续 N 轮都判定为死号。
+    auto_prune_rounds: int = 1
+    # 每轮最多删几个，防止一次异常把池子清空。
+    auto_prune_max_per_run: int = 5
+
 
 @dataclass
 class VideoSettings:
@@ -295,6 +314,23 @@ class VideoSettings:
     # The signed download URL is good for about two hours; the download itself
     # gets its own bound so a stalled CDN fetch cannot wedge a worker.
     download_timeout_sec: int = 300
+    # H3 / H3-Max are paid models whose plugin *asks* for a billing
+    # confirmation before it orders anything.  A headless turn has nobody to
+    # answer, so the turn ends on the question and nothing is submitted — the
+    # job then burns its whole polling window and reports the generic "no
+    # artefact".  Answering the question is the difference between a video
+    # and an empty row, so it is on by default.
+    auto_confirm_billing: bool = True
+    # How many times one job answers a confirmation request before it gives
+    # up.  One is the normal case; a second means the agent asked again
+    # after a clear answer, and answering again only burns another turn.
+    max_billing_confirmations: int = 2
+    # Refuse, before spending a turn, a model the account cannot pay for.
+    # The upstream rejects an H3 submit on a Token-Plan-only account with a
+    # `402` *after* the agent has already done minutes of work, so the
+    # check is worth a membership read.  A read failure is never a refusal:
+    # an unreadable balance must not stop a job that might well succeed.
+    preflight_billing_check: bool = True
 
 
 @dataclass

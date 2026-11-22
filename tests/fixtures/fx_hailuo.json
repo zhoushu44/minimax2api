@@ -1,0 +1,40 @@
+{
+  "has_more": false,
+  "base_resp": {
+    "status_msg": "ok",
+    "status_code": 0
+  },
+  "summaries": [
+    {
+      "user_input": {
+        "msg_id": "462986996134108",
+        "content_head": "@video-creater 一只橘猫慢慢走过草地，阳光很好（计费已确认：允许扣减账户积分/周限额，请直接提交生成，不要再询问确认。） <video-generation-options> {\"duration\":6,\"model\":\"MiniMax-Hailuo-2.3\",\"ratio\":\"16:9\",\"resolution\":\"768P\"} </video-generation-options",
+        "timestamp": 1794587034055
+      },
+      "assistant_response": {
+        "msg_id": "msg-01a1d5bc242a744dbb72549205dfc97d",
+        "content_head": "搞定啦 🐈橘猫视频已经生成好了。 **成品**：一只橘白虎斑猫在金色阳光的草地上慢慢走过，低机位跟拍、逆光轮廓光、浅景深，最后缓缓停在光里。 - 模型：`MiniMax-Hailuo-2.3`｜时长 6 秒｜分辨率 768P（1366×768，16:9） - 格式：H.264 MP4，2.7 MB，已校验可播放 - 计费：按你确认的走，H2.3 走账户积分/周限额 两点需要说明： 1. **H2.",
+        "timestamp": 1794587241940
+      },
+      "artifacts": [
+        {
+          "cdn_url": "",
+          "source": 2,
+          "created_at": 1794587178660,
+          "updated_at": 1794587242256,
+          "is_favorited": false,
+          "node_id": "462988042428530",
+          "node_type": 2,
+          "name": "462987508895945.mp4",
+          "file_ext": "mp4",
+          "category": "videos",
+          "mime_type": "video/mp4",
+          "size_bytes": 2720090,
+          "session_id": "462988012028047",
+          "parent_id": "462988042428529"
+        }
+      ],
+      "file_change_count": 0
+    }
+  ]
+}

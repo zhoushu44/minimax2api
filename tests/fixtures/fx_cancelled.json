@@ -1,0 +1,22 @@
+{
+  "base_resp": {
+    "status_code": 0,
+    "status_msg": "ok"
+  },
+  "summaries": [
+    {
+      "user_input": {
+        "content_head": "@video-creater 月球人大战变形金刚（计费已确认：允许扣减账户积分/周限额，请直接提交生成，不要再询问确认。） <video-generation-options> {\"duration\":6,\"model\":\"MiniMax-H3-Max\",\"ratio\":\"16:9\",\"resolution\":\"768P\"} </video-generation-options>",
+        "timestamp": 1794594719906,
+        "msg_id": "463017588277481"
+      },
+      "assistant_response": {
+        "timestamp": 1794594811191,
+        "msg_id": "msg-01a1d62f99c4766bb8a18b311e0dfdc8",
+        "content_head": "参数全部校验通过：提示词 2654 码点（上限 7000）、请求体 2.7KB、输出路径无冲突，提交记录已落盘。 有一点要先说清楚：video-creater 对 H3 / H3-Max 这类付费提交，在**实时工具契约**里写死了「必须先告知计费方式与参数、拿到用户对本次提交的明确确认才能提交」，并明确把“直接生成”“别再问”这类提前授权排除在确认之外。所以我不能拿你这条预授权直接开跑——但这一"
+      },
+      "file_change_count": 0
+    }
+  ],
+  "has_more": false
+}

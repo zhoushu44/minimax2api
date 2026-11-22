@@ -1,0 +1,22 @@
+{
+  "summaries": [
+    {
+      "user_input": {
+        "msg_id": "462990610260104",
+        "content_head": "@video-creater 一朵云（计费已确认：允许扣减账户积分/周限额，请直接提交生成，不要再询问确认。） <video-generation-options> {\"duration\":1,\"model\":\"MiniMax-H3\",\"ratio\":\"16:9\",\"resolution\":\"768P\"} </video-generation-options>",
+        "timestamp": 1794587708737
+      },
+      "assistant_response": {
+        "content_head": "这次没生成成——不是提示词或参数问题，是账户余额不够，扣费在服务端就被拒了。 **发生了什么** - 提交返回 `code: 402`：M Plan 剩余周限额 + 账户积分合计覆盖不了这次 MiniMax-H3 生成；旧版 Token Plan 用量额度不能用于 H3 系列。 - 本次任务成本 **320 积分**（周限额覆盖时按等值积分折算）。 - 服务端明确返回失败，**没有创建生成任务**",
+        "timestamp": 1794587764568,
+        "msg_id": "msg-01a1d5c41c0479909ff8c224eb3e9381"
+      },
+      "file_change_count": 0
+    }
+  ],
+  "has_more": false,
+  "base_resp": {
+    "status_code": 0,
+    "status_msg": "ok"
+  }
+}

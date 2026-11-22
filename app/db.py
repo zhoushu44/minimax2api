@@ -892,13 +892,18 @@ class Database:
             job = video_job_from_row(row)
             apply_fn(job)
             job.updated_at = records.now_ts()
+            # FIX_VIDEO_PARAMS_OFFSET: video_job_params 以 job.id 开头，
+            # 但这条 UPDATE 的 SET 里没有 id（id 只出现在 WHERE）。
+            # 直接传整元组会整体错位一位：prompt 被写成 id、session_id 被写成
+            # account_id…… 表现是「session_id 永远为空 → no session to watch」。
+            # 必须跳过第一个元素，再单独补 WHERE 的 id。
             conn.execute(
                 "UPDATE video_jobs SET prompt = ?, model = ?, duration = ?, ratio = ?,"
                 " resolution = ?, account_id = ?, session_id = ?, status = ?, detail = ?,"
                 " error = ?, node_id = ?, media_name = ?, file_size = ?,"
                 " credit_before = ?, credit_after = ?, started_at_ms = ?, created_at = ?, updated_at = ?"
                 " WHERE id = ?",
-                video_job_params(job),
+                video_job_params(job)[1:] + (job.id,),
             )
             conn.commit()
             return job

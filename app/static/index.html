@@ -330,12 +330,8 @@ b@example.com----Password456"></textarea>
         <div><label>模型</label><select id="video-model"></select></div>
         <div><label>账号</label><select id="video-account"></select></div>
         <div style="flex:0 0 auto"><label>时长（秒）</label><input id="video-duration" type="number" min="1" max="15" value="6" style="width:80px"></div>
-        <div style="flex:0 0 auto"><label>画幅</label><select id="video-ratio">
-          <option value="16:9">16:9</option><option value="9:16">9:16</option><option value="1:1">1:1</option>
-        </select></div>
-        <div style="flex:0 0 auto"><label>分辨率</label><select id="video-resolution">
-          <option value="768P">768P</option><option value="480P">480P</option><option value="1080P">1080P</option>
-        </select></div>
+        <div style="flex:0 0 auto"><label>画幅</label><select id="video-ratio"></select></div>
+        <div style="flex:0 0 auto"><label>分辨率</label><select id="video-resolution"></select></div>
         <div style="flex:0 0 auto;align-self:flex-end"><button id="video-submit">提交</button></div>
       </div>
       <p class="muted" style="font-size:12px;margin:6px 0 0" id="video-model-note"></p>
@@ -578,16 +574,25 @@ async function renderDashboard() {
     .map(([label, value]) => `<div class="stat"><b>${value}</b><span>${label}</span></div>`)
     .join("");
 
-  const trend = stats.trend || [];
-  const latest = trend[trend.length - 1];
-  const body = [
-    row(["今日", latest ? latest.requests ?? 0 : 0, latest ? latest.errors ?? 0 : 0, latest ? latest.tokens ?? 0 : 0]),
-    row(["近 14 天", trend.reduce((sum, day) => sum + (day.requests ?? 0), 0)]
-      .concat([trend.reduce((sum, day) => sum + (day.errors ?? 0), 0), trend.reduce((sum, day) => sum + (day.tokens ?? 0), 0)])),
-  ];
-  $("#recent-audits").innerHTML = body
-    .map((cells) => row([cells[0], cells[1], cells[2], cells[3]]))
-    .join("");
+  // 近期请求：读真实审计记录（表头 7 列：时间/模型/账号/状态/耗时/Tokens/错误）
+  let audits = [];
+  try {
+    const page = await api("/admin/api/audits?limit=20");
+    audits = page.items || [];
+  } catch (err) {
+    audits = [];
+  }
+  $("#recent-audits").innerHTML = audits.length
+    ? audits.map((a) => {
+        const when = a.createdAt ? new Date(a.createdAt).toLocaleString("zh-CN", { hour12: false }) : "";
+        const status = a.status ?? "";
+        const bad = Number(status) >= 400 || a.outcome === "error";
+        const statusCell = `<span class="pill ${bad ? "bad" : "ok"}">${status}</span>`;
+        const tokens = (a.promptTokens ?? 0) + "/" + (a.completionTokens ?? 0);
+        const err = a.error ? String(a.error).slice(0, 120) : "";
+        return row([when, a.model || "", a.accountName || "", statusCell, (a.latencyMs ?? 0) + " ms", tokens, err]);
+      }).join("")
+    : row(['<span class="muted">暂无记录</span>', "", "", "", "", "", ""]);
 }
 
 async function renderAccounts() {
@@ -693,7 +698,7 @@ async function renderAudits() {
     audit.latencyMs + " ms",
     `${audit.promptTokens}/${audit.completionTokens}`,
     audit.error ? `<span class="muted">${audit.error}</span>` : "",
-  ])).join("") || row(['<td colspan="7" class="muted">没有记录</td>']);
+  ])).join("") || '<tr><td colspan="7" class="muted">没有记录</td></tr>';
   const page = Math.floor(state.audits.offset / state.audits.limit) + 1;
   const pages = Math.max(1, Math.ceil(state.audits.total / state.audits.limit));
   $("#audit-page").textContent = `第 ${page} / ${pages} 页（共 ${state.audits.total} 条）`;
@@ -790,7 +795,7 @@ async function renderVideos() {
         ? `<button class="danger small" data-video-act="delete" data-id="${job.id}">删除</button>`
         : "",
     ].join(" "),
-  ])).join("") || row(['<td colspan="8" class="muted">还没有视频任务。</td>']);
+  ])).join("") || '<tr><td colspan="8" class="muted">还没有视频任务。</td></tr>';
 
   // Keep the page fresh while anything is running, and stop the moment it is
   // not: a finished video will not change again, and polling a settled list
@@ -805,11 +810,40 @@ async function renderVideos() {
   }
 }
 
+// 各模型合法的画幅/分辨率。官方文档：
+//   H3 / H3-Max  resolution: 768P | 2K
+//   Hailuo 2.3   resolution: 768P | 1080P
+// 传不存在的档位不会报错，会被 agent 自行解释然后出片尺寸不对 —— 所以这里按模型锁死。
+const VIDEO_CAPS = {
+  "minimax-h3-max":     { ratios: ["16:9", "9:16", "1:1"], resolutions: ["768P", "2K"] },
+  "minimax-h3":         { ratios: ["16:9", "9:16", "1:1"], resolutions: ["768P", "2K"] },
+  "minimax-hailuo-2-3": { ratios: ["16:9", "9:16", "1:1"], resolutions: ["768P", "1080P"] },
+};
+const VIDEO_CAPS_FALLBACK = { ratios: ["16:9"], resolutions: ["768P"] };
+
+function fillSelect(sel, values, preferred) {
+  const keep = preferred || sel.value;
+  sel.innerHTML = values.map((v) => `<option value="${v}">${v}</option>`).join("");
+  sel.value = values.includes(keep) ? keep : values[0];
+}
+
 function videoModelNote(models) {
   const list = models || state.videoModels || [];
   state.videoModels = list;
-  const model = list.find((item) => item.id === $("#video-model").value);
+  const modelId = $("#video-model").value;
+  const model = list.find((item) => item.id === modelId);
   $("#video-model-note").textContent = model ? model.note : "";
+
+  // 只给这个模型合法的选项；原来那档是另一个模型的，就回落到第一个合法值。
+  const caps = VIDEO_CAPS[modelId] || VIDEO_CAPS_FALLBACK;
+  fillSelect($("#video-ratio"), caps.ratios, $("#video-ratio").value);
+  fillSelect($("#video-resolution"), caps.resolutions, $("#video-resolution").value);
+}
+
+// 首次进入视频页时模型列表是异步来的，选项还没填，这里补一次默认渲染。
+if (document.readyState !== "loading") {
+  const initial = $("#video-model");
+  if (initial && initial.options.length) videoModelNote();
 }
 
 $("#video-model").addEventListener("change", () => videoModelNote());
@@ -848,6 +882,9 @@ const SETTING_LABELS = {
   "signup.gap_seconds": "批量注册间隔（秒）",
   "keepalive.enabled": "启用 Token 保活",
   "keepalive.interval_sec": "保活巡检间隔（秒）",
+  "keepalive.auto_prune": "自动清理确定性死号",
+  "keepalive.auto_prune_rounds": "死号确认轮数（默认 1）",
+  "keepalive.auto_prune_max_per_run": "单轮最多清理数（默认 5）",
   "video.default_duration": "视频默认时长（秒）",
   "video.default_ratio": "视频默认画幅",
   "video.default_resolution": "视频默认分辨率",

@@ -2046,10 +2046,14 @@ class _VideoClient:
         return {"enabled": True}
 
     async def credit(self, cred):
-        class _C:
-            total = 100.0
+        # The video pre-flight reads the paid bucket and the plan name off the
+        # same document, so the stub carries them: purchased=100 stands for an
+        # account that can pay for an H3 turn.
+        from app.upstream import CreditInfo
 
-        return _C()
+        return CreditInfo(total=100.0, free=0.0, purchased=100.0,
+                          plan_name="", plan_type=1,
+                          subscription_type="none", has_token_plan=False)
 
     async def create_session(self, cred):
         return "sess-1"

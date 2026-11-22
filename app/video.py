@@ -44,6 +44,7 @@ from typing import Any, Callable
 import httpx
 
 from . import upstream
+from . import videobilling
 from .records import (
     VIDEO_DONE,
     VIDEO_DOWNLOADING,
@@ -71,17 +72,17 @@ VIDEO_MODELS: dict[str, dict[str, str]] = {
     "minimax-h3-max": {
         "name": "MiniMax H3 Max",
         "upstream": "MiniMax-H3-Max",
-        "note": "约 20 秒出片，消耗账号积分",
+        "note": "约 20 秒出片；只能从 M Plan 周限额/已购积分扣费，签到赠送积分付不了",
     },
     "minimax-h3": {
         "name": "MiniMax H3.0",
         "upstream": "MiniMax-H3",
-        "note": "质量优先，15-30 分钟，消耗账号积分",
+        "note": "质量优先，15-30 分钟；只能从 M Plan 周限额/已购积分扣费，签到赠送积分付不了",
     },
     "minimax-hailuo-2-3": {
         "name": "MiniMax Hailuo 2.3",
         "upstream": "MiniMax-Hailuo-2.3",
-        "note": "低成本，可用 Token Plan，输出无声视频",
+        "note": "低成本，可用 Token Plan / 签到积分，输出无声视频",
     },
 }
 
@@ -342,14 +343,29 @@ class VideoService:
         settings = self._settings_fn()
         slot = self._slot_limit()
         async with slot:
-            if not job.session_id:
-                await self._turn(job_id)
-            await self._watch(job_id, settings)
+            sid = job.session_id
+            if not sid:
+                sid, settled = await self._turn(job_id)
+                if settled:
+                    # The turn itself decided the job: it was refused before
+                    # anything was submitted (no bucket to bill) or the submit
+                    # came back refused.  There is nothing in the drive to
+                    # wait for, and polling for it would burn the whole window
+                    # to report a cause the turn already knows.
+                    return
+            elif await self._resume_turn(job_id):
+                return
+            await self._watch(job_id, settings, session_id=sid)
 
     # -------------------------------------------------------------------- turn
 
-    async def _turn(self, job_id: str) -> None:
-        """One video turn: enable, session, message.  The stream is best-effort.
+    async def _turn(self, job_id: str) -> tuple[str, bool]:
+        """One video turn: enable, session, message, then answer the questions.
+
+        Returns ``(session_id, settled)``.  ``settled`` means the job is
+        already in a terminal state and the caller must not go on to poll:
+        either the account could not pay for the model and nothing was
+        attempted, or the upstream refused the submit and said so.
 
         The order is load-bearing.  The session id is stored the moment
         create_session answers, *before* the message goes out, because a stream
@@ -367,7 +383,7 @@ class VideoService:
         """
         job = await self._db.video_job(job_id)
         if job is None:
-            return
+            return "", True
         settings = self._settings_fn()
         account = await self._db.account_by_id(job.account_id)
         if account is None:
@@ -378,6 +394,8 @@ class VideoService:
         cred = upstream.credential_of(lease.account)
         served = False
         fatal: upstream.UpstreamError | None = None
+        settled = False
+        session_id = ""
         try:
             if settings.video.auto_enable_plugin:
                 # Free and idempotent.  A turn against an account without the
@@ -398,7 +416,18 @@ class VideoService:
                 fatal = err
                 raise
             except upstream.UpstreamError:
-                pass  # an unreadable balance must not stop the turn it precedes
+                before = None  # an unreadable balance must not stop the turn it precedes
+
+            # Refuse a model this account cannot pay for, before the turn
+            # spends the minutes the agent needs to reach the submit.  The
+            # upstream answers such a submit with a `402` only after all of
+            # that work is already billed, so the check pays for itself.
+            blocked = self._billing_block(job, settings, before)
+            if blocked:
+                await self._settle_failure(job_id, cred, blocked)
+                served = True
+                settled = True
+                return "", True
 
             # A session id is the one fact the watcher cannot reconstruct, so it
             # is captured before anything that could consume the turn's budget.
@@ -443,12 +472,151 @@ class VideoService:
                 # know and let the watcher decide by looking at the drive.
                 log.warning("video %s: turn error, still watching: %s", job_id, err)
                 await self._mutate(job_id, detail=str(err)[:2000])
+
+            # The plugin asks before it orders a paid generation, and a
+            # headless turn has nobody to answer.  Answering it here is the
+            # difference between a video and a row that burns the whole
+            # polling window and then reports the generic "no artefact".
+            # The turn's own streamed text is passed in: it is authoritative
+            # and immediate, while the summaries endpoint can still be a turn
+            # behind at the moment the stream closes.
+            settled = await self._answer_billing(
+                job_id, cred, session_id, settings, (result.text or "") if served else ""
+            )
+            if settled:
+                return session_id, True
         finally:
             # `served` is the health signal.  A credential the upstream refused
             # retires the account; a stream that merely died leaves it whole.
             await self._pool.release(
                 lease, success=served, error=fatal if not served else None
             )
+        return session_id, settled
+
+    async def _answer_billing(
+        self,
+        job_id: str,
+        cred: upstream.Credential,
+        session_id: str,
+        settings: Any,
+        turn_text: str = "",
+    ) -> bool:
+        """Answer a billing confirmation the turn stopped on.
+
+        Returns True when the job is settled (a refusal came back) and the
+        caller must not poll.  False means either no question was asked or
+        the question was answered and the submit is now in flight.
+
+        The reply is sent into the *same* session, because that is what the
+        plugin is waiting for: its skill treats a confirmation inside the
+        original message as an instruction to skip the notice, not as the
+        notice's answer, and it says so in as many words ("之前的『直接提交』
+        不算作确认").  A second message in the session is the answer it
+        accepts — verified against the live upstream.
+
+        ``turn_text`` is the turn's own streamed answer.  It is preferred over
+        the summaries read because it is immediate and authoritative: the
+        summaries endpoint can lag a turn behind at the moment the stream
+        closes, and reading the previous turn's "please confirm" twice would
+        answer the same question twice and leave the real one standing.
+        """
+        if not settings.video.auto_confirm_billing:
+            return False
+        limit = max(1, int(settings.video.max_billing_confirmations))
+        answered = 0
+        text = turn_text
+        while True:
+            verdict = videobilling.classify(text)
+            if verdict.refused:
+                await self._settle_failure(
+                    job_id,
+                    cred,
+                    f"{verdict.reason}（上游拒绝计费，本次未创建生成任务，未产生视频）",
+                )
+                return True
+            if not verdict.needs_confirmation:
+                return False
+            if answered >= limit:
+                # The limit is reached with the question still standing: the
+                # agent is not going to submit on its own, and polling would
+                # only wait out the window to report the generic message.
+                await self._settle_failure(
+                    job_id,
+                    cred,
+                    "上游连续要求确认计费，自动回复后仍未提交生成（未产生视频）",
+                )
+                return True
+            answered += 1
+            log.info(
+                "video %s: upstream asked for a billing confirmation, answering (%d/%d)",
+                job_id,
+                answered,
+                limit,
+            )
+            options = upstream.Options(
+                text=videobilling.CONFIRMATION_REPLY,
+                client_intent=upstream.VIDEO_CLIENT_INTENT,
+                timeout=float(settings.video.turn_timeout_sec),
+                idle_timeout=float(settings.video.idle_timeout_sec),
+            )
+            try:
+                result = await self._client.send_message(
+                    cred, options, session_id, float(settings.video.turn_timeout_sec)
+                )
+                if isinstance(result, tuple):
+                    result, stream_error = result
+                    log.warning("video %s: confirm stream broke: %s", job_id, stream_error)
+            except upstream.UpstreamError as err:
+                # The confirmation could not be delivered.  That is
+                # inconclusive about the job, so it is recorded and the
+                # watcher still gets its turn: a submit may have gone out.
+                log.warning("video %s: confirm send failed: %s", job_id, err)
+                return False
+            text = result.text or ""
+            await self._mutate(
+                job_id,
+                detail=(
+                    f"[已自动回复计费确认 {answered}/{limit}] {videobilling.CONFIRMATION_REPLY}\n\n"
+                    + text
+                )[:8000],
+            )
+
+    def _billing_block(
+        self, job: VideoJob, settings: Any, info: upstream.CreditInfo | None
+    ) -> str:
+        """The reason this job cannot be paid for, or "" when it can.
+
+        An H3 / H3-Max submit is billed from the M Plan weekly limit or from
+        *purchased* credits.  An account whose whole balance is sign-in gift
+        points reads as rich and still cannot pay: the upstream answers the
+        submit with `402`, after the agent has already spent minutes of
+        credit reaching it.  The membership document is the only place that
+        distinction is visible — `purchased` is the paid bucket, `free` is the
+        gifted one — and `credit()` already reads it, so the check rides on a
+        request the turn was making anyway.
+
+        A balance this bridge cannot read is *not* a block.  `info` is None
+        when the read failed, and an unreadable balance is not an empty one:
+        refusing on it would fail jobs that would have worked.
+        """
+        if not settings.video.preflight_billing_check:
+            return ""
+        if info is None:
+            return ""
+        if not videobilling.model_needs_m_plan(job.model):
+            return ""
+        if info.purchased > 0:
+            return ""
+        subscribed = (info.subscription_type or "").strip().lower()
+        has_m_plan = bool((info.plan_name or "").strip()) and subscribed not in ("", "none")
+        if has_m_plan:
+            return ""
+        return (
+            f"{job.model} 只能从 M Plan 周限额或已购积分扣费；账号 "
+            f"{job.account_id} 的已购积分为 0，且没有 M Plan 订阅。"
+            "上游会在提交阶段返回 402，本次未提交、未扣费。"
+            "改用 MiniMax Hailuo 2.3，或给账号充值/开通 M Plan。"
+        )
 
     async def _mutate(self, job_id: str, **fields: Any) -> None:
         """Write named job fields."""
@@ -461,7 +629,52 @@ class VideoService:
 
     # ------------------------------------------------------------------- watch
 
-    async def _watch(self, job_id: str, settings: Any) -> None:
+    async def _resume_turn(self, job_id: str) -> bool:
+        """Pick a resumed job up where it actually stopped.
+
+        A job can be restarted after a process death at two awkward points,
+        and both otherwise cost a full polling window for nothing:
+
+        * the previous process sent the message and died before the agent
+          answered the billing question — the session is sitting on a
+          question nobody will ever reply to, so nothing is submitted;
+        * the agent already answered with a refusal — there is nothing to
+          wait for at all.
+
+        Both are visible in the session's last turn, which is a free read.
+        Returns True when the job is settled and must not be polled.
+        """
+        job = await self._db.video_job(job_id)
+        if job is None or not job.session_id:
+            return False
+        settings = self._settings_fn()
+        if not settings.video.auto_confirm_billing:
+            return False
+        account = await self._db.account_by_id(job.account_id)
+        if account is None:
+            return False
+        cred = upstream.credential_of(account)
+        try:
+            text = await self._client.session_last_reply(cred, job.session_id)
+        except upstream.UpstreamError as err:
+            log.debug("video %s: summaries read failed on resume: %s", job_id, err)
+            return False
+        if not text:
+            return False
+        verdict = videobilling.classify(text)
+        if verdict.refused:
+            await self._settle_failure(
+                job_id,
+                cred,
+                f"{verdict.reason}（上游拒绝计费，本次未创建生成任务，未产生视频）",
+            )
+            return True
+        if not verdict.needs_confirmation:
+            return False
+        log.info("video %s: resumed onto a billing question, answering it", job_id)
+        return await self._answer_billing(job_id, cred, job.session_id, settings, text)
+
+    async def _watch(self, job_id: str, settings: Any, session_id: str = '') -> None:
         """Poll the drive until the file lands or the budget runs out.
 
         The cutoff is the instant the message was sent, so a long-lived
@@ -471,7 +684,8 @@ class VideoService:
         cutoff rather than inventing one.
         """
         job = await self._db.video_job(job_id)
-        if job is None or not job.session_id:
+        sid = session_id or (job.session_id if job else '')
+        if not sid:
             raise VideoError("no session to watch")
         account = await self._db.account_by_id(job.account_id)
         if account is None:
@@ -503,7 +717,7 @@ class VideoService:
                 videos = [{"node_id": job.node_id}]
                 break
             try:
-                artifacts = await self._client.session_artifacts(cred, job.session_id)
+                artifacts = await self._client.session_artifacts(cred, sid)
             except upstream.UpstreamError as err:
                 # A failed lookup is not a failed job: "no media" and "the
                 # lookup broke" must stay different answers, and one transient
@@ -520,6 +734,13 @@ class VideoService:
                 videos = fresh
                 await self._mutate(job_id, node_id=str(fresh[0].get("node_id") or ""))
                 break
+            # Nothing landed *yet* is not the same as nothing will land — but a
+            # refusal says nothing will, and it is worth reading early rather
+            # than waiting out a window the upstream has already answered.
+            refusal = await self._refused_reason(job_id, cred, sid)
+            if refusal:
+                await self._settle_failure(job_id, cred, refusal)
+                return
 
         if not videos:
             # Not a verdict that the render failed.  The upstream bills whether
@@ -527,6 +748,12 @@ class VideoService:
             # after this window closes — the probe rounds showed exactly that
             # decoupling.  The message says what is actually known: nothing was
             # seen in the window, and the work may still be running upstream.
+            # A refusal found on the way out is the exception: then the window
+            # is not the finding, the refusal is.
+            refusal = await self._refused_reason(job_id, cred, sid)
+            if refusal:
+                await self._settle_failure(job_id, cred, refusal)
+                return
             await self._settle_failure(
                 job_id,
                 cred,
@@ -590,6 +817,29 @@ class VideoService:
                     )
                 chunks.append(chunk)
         return b"".join(chunks)
+
+    async def _refused_reason(
+        self, job_id: str, cred: upstream.Credential, session_id: str
+    ) -> str:
+        """The upstream's own refusal reason for this job, or "" if none yet.
+
+        Read from the session's prose rather than from the stored job, because
+        the answer can arrive after the stream closed: the submit goes out
+        near the end of a turn, and the `402` comes back a moment later.  A
+        job resumed after a restart has no stream at all, so this is the only
+        place its cause survives.
+        """
+        if not session_id:
+            return ""
+        try:
+            text = await self._client.session_last_reply(cred, session_id)
+        except upstream.UpstreamError as err:
+            log.debug("video %s: summaries read failed: %s", job_id, err)
+            return ""
+        verdict = videobilling.detect_refusal(text)
+        if verdict.refused:
+            return f"{verdict.reason}（上游拒绝计费，本次未创建生成任务，未产生视频）"
+        return ""
 
     async def _settle_failure(self, job_id: str, cred: upstream.Credential, reason: str) -> None:
         try:
